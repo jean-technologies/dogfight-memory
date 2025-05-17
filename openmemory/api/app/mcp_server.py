@@ -215,108 +215,113 @@ async def list_memories() -> str:
         logging.exception(f"[list_memories] Exception: {e}")
         return json.dumps({"error": f"Error listing memories: {str(e)}"}, indent=2)
 
-@mcp.tool(description="Fetches the most recently added memory. If it is a file pointer, returns file content.")
+@mcp.tool(description="Fetches the most recently added memory. If it is a file pointer (known to mem0), returns file content.")
 async def get_last_memory() -> str:
-    logging.info("[get_last_memory] Called (full file-aware version)")
+    logging.info("[get_last_memory] Called (Reverted to mem0-centric logic - V7)")
     uid = user_id_var.get(None)
-    client_name = client_name_var.get(None)
+    client_name = client_name_var.get(None) 
 
     if not uid: return json.dumps({"error": "user_id not provided"}, indent=2)
-    if not client_name: return json.dumps({"error": "client_name not provided"}, indent=2)
+    # client_name is needed for get_user_and_app for permission checks
+    if not client_name: 
+        logging.warning("[get_last_memory] client_name not provided, using default for fallback.")
+        client_name = "default_client_for_mem0_fallback"
 
+    db = None
     try:
         db = SessionLocal()
-        try:
-            user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
-            if not user or not app: 
-                logging.error(f"[get_last_memory] User or App not found for uid: {uid}, client: {client_name}")
-                return json.dumps({"error": "User or App context not found"}, indent=2)
+        user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
+        if not user or not app: 
+            logging.error(f"[get_last_memory] User/App context missing for uid {uid}, client {client_name}")
+            # Try to close DB before returning if it was opened
+            if db: db.close()
+            return json.dumps({"error": "User or App context not found for mem0 lookup."}, indent=2)
 
-            logging.info(f"[get_last_memory] Calling memory_client.get_all for user {uid}")
-            all_memories_data_from_mem0 = memory_client.get_all(user_id=uid)
-            logging.info(f"[get_last_memory] memory_client.get_all raw response: {all_memories_data_from_mem0}")
+        logging.info(f"[get_last_memory] Calling memory_client.get_all for user {uid}")
+        all_memories_data_from_mem0 = memory_client.get_all(user_id=uid)
+        logging.info(f"[get_last_memory] memory_client.get_all raw response: {all_memories_data_from_mem0}")
+        
+        memories_list_from_mem0 = []
+        if isinstance(all_memories_data_from_mem0, dict) and 'results' in all_memories_data_from_mem0:
+            memories_list_from_mem0 = all_memories_data_from_mem0['results']
+        elif isinstance(all_memories_data_from_mem0, list):
+            memories_list_from_mem0 = all_memories_data_from_mem0
+
+        if not memories_list_from_mem0:
+            logging.info("[get_last_memory] No memories found from memory_client.get_all.")
+            if db: db.close()
+            return json.dumps({"message": "No memories found in mem0 store."}, indent=2)
+
+        memories_list_from_mem0.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        logging.info(f"[get_last_memory] Sorted {len(memories_list_from_mem0)} candidates from mem0.")
+
+        for mem_candidate_from_mem0 in memories_list_from_mem0:
+            if not mem_candidate_from_mem0.get('id'): 
+                logging.warning(f"[get_last_memory] mem0 candidate missing id: {mem_candidate_from_mem0}")
+                continue
+            try: 
+                memory_id_uuid = uuid.UUID(mem_candidate_from_mem0['id'])
+            except ValueError: 
+                logging.warning(f"[get_last_memory] Invalid UUID for mem0 candidate ID: {mem_candidate_from_mem0['id']}")
+                continue
             
-            memories_list_from_mem0 = []
-            if isinstance(all_memories_data_from_mem0, dict) and 'results' in all_memories_data_from_mem0:
-                memories_list_from_mem0 = all_memories_data_from_mem0['results']
-            elif isinstance(all_memories_data_from_mem0, list):
-                memories_list_from_mem0 = all_memories_data_from_mem0
-            # else: log or handle unexpected format if necessary
+            sql_memory_obj = db.query(Memory).filter(Memory.id == memory_id_uuid, Memory.user_id == user.id).first()
 
-            if not memories_list_from_mem0:
-                logging.info("[get_last_memory] No memories found from memory_client.get_all.")
-                return json.dumps({"message": "No memories found"}, indent=2)
-
-            # Sort by created_at from mem0 data to find the latest candidate
-            memories_list_from_mem0.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-            logging.info(f"[get_last_memory] Sorted {len(memories_list_from_mem0)} candidates from mem0.")
-
-            for mem_candidate_from_mem0 in memories_list_from_mem0:
-                if 'id' not in mem_candidate_from_mem0:
-                    logging.warning(f"[get_last_memory] mem0 candidate missing id: {mem_candidate_from_mem0}")
-                    continue
-                try:
-                    memory_id_uuid = uuid.UUID(mem_candidate_from_mem0['id'])
-                except ValueError:
-                    logging.warning(f"[get_last_memory] Invalid UUID for mem0 candidate ID: {mem_candidate_from_mem0['id']}")
-                    continue
+            if sql_memory_obj and check_memory_access_permissions(db, sql_memory_obj, app.id):
+                logging.info(f"[get_last_memory] Found accessible SQL-backed mem0 memory: {sql_memory_obj.id}")
+                authoritative_metadata = sql_memory_obj.metadata_ or {}
                 
-                # Fetch corresponding SQL Memory object to get our authoritative metadata and check permissions
-                sql_memory_obj = db.query(Memory).filter(Memory.id == memory_id_uuid, Memory.user_id == user.id).first()
+                # Log access for the memory record itself
+                access_log = MemoryAccessLog(
+                    memory_id=memory_id_uuid, app_id=app.id, access_type="get_last_attempt",
+                    metadata_={'hash': mem_candidate_from_mem0.get('hash'), 'sql_type': authoritative_metadata.get('type')}
+                )
+                db.add(access_log)
+                # db.commit() # Commit with other operations or at end of successful path
 
-                if sql_memory_obj and check_memory_access_permissions(db, sql_memory_obj, app.id):
-                    logging.info(f"[get_last_memory] Found accessible SQL memory: {sql_memory_obj.id}, type in metadata: {sql_memory_obj.metadata_.get('type') if sql_memory_obj.metadata_ else 'N/A'}")
-                    # Log access for the memory pointer/record itself
-                    access_log = MemoryAccessLog(
-                        memory_id=memory_id_uuid, app_id=app.id, access_type="get_last_attempt",
-                        metadata_={'hash': mem_candidate_from_mem0.get('hash')}
-                    )
-                    db.add(access_log)
-                    # db.commit() # Commit later
+                if authoritative_metadata.get("type") == FILE_POINTER_MEMORY_TYPE and 'file_path_in_container' in authoritative_metadata:
+                    file_path_str = authoritative_metadata['file_path_in_container']
+                    original_filename_from_meta = authoritative_metadata.get('original_filename', Path(file_path_str).name)
+                    logging.info(f"[get_last_memory] Is file pointer. Path from SQL metadata: {file_path_str}")
+                    try:
+                        actual_file_path = Path(file_path_str)
+                        if actual_file_path.is_file():
+                            with open(actual_file_path, 'r', encoding='utf-8') as f:
+                                file_content = f.read()
+                            logging.info(f"[get_last_memory] Successfully read file content from {actual_file_path}")
+                            db.commit() # Commit access log for successful file read
+                            if db: db.close()
+                            return json.dumps({
+                                "type": "file_content",
+                                "retrieval_method": "mem0_pointer_lookup",
+                                "original_filename": original_filename_from_meta,
+                                "stored_filename": authoritative_metadata.get('stored_filename'),
+                                "char_length": authoritative_metadata.get('char_length'),
+                                "content": file_content,
+                                "retrieved_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                                "original_memory_id": str(memory_id_uuid),
+                                "pointer_details": authoritative_metadata
+                            }, indent=2)
+                        else:
+                            logging.error(f"[get_last_memory] File not found at path from SQL metadata: {actual_file_path} (for mem0 ID {memory_id_uuid})")
+                    except Exception as e_file:
+                        logging.exception(f"[get_last_memory] Error reading file {file_path_str} from SQL metadata (for mem0 ID {memory_id_uuid}): {e_file}")
+                
+                # If not a file pointer, or file operation failed/file not found, return the direct mem0 memory
+                logging.info(f"[get_last_memory] Returning direct mem0 memory (or pointer text if file op failed): {mem_candidate_from_mem0['id']}")
+                db.commit() # Commit access log for the memory itself
+                if db: db.close()
+                return json.dumps(mem_candidate_from_mem0, indent=2)
+        
+        logging.info("[get_last_memory] No accessible mem0 memories found after filtering.")
+        db.commit() # Commit any pending logs
+        if db: db.close()
+        return json.dumps({"message": "No accessible mem0 memories found after filtering."}, indent=2)
 
-                    authoritative_metadata = sql_memory_obj.metadata_ or {}
-                    if authoritative_metadata.get("type") == FILE_POINTER_MEMORY_TYPE and 'file_path_in_container' in authoritative_metadata:
-                        file_path_str = authoritative_metadata['file_path_in_container']
-                        original_filename_from_meta = authoritative_metadata.get('original_filename', Path(file_path_str).name)
-                        logging.info(f"[get_last_memory] Is file pointer. Path: {file_path_str}")
-                        try:
-                            actual_file_path = Path(file_path_str)
-                            if actual_file_path.is_file():
-                                with open(actual_file_path, 'r', encoding='utf-8') as f:
-                                    file_content = f.read()
-                                logging.info(f"[get_last_memory] Successfully read file content from {actual_file_path}")
-                                db.commit() # Commit access log for successful file read
-                                return json.dumps({
-                                    "type": "file_content",
-                                    "original_filename": original_filename_from_meta,
-                                    "stored_filename": authoritative_metadata.get('stored_filename'),
-                                    "char_length": authoritative_metadata.get('char_length'),
-                                    "content": file_content,
-                                    "retrieved_at": datetime.datetime.now(datetime.UTC).isoformat(),
-                                    "original_memory_id": str(memory_id_uuid),
-                                    "pointer_details": authoritative_metadata # Include all pointer details
-                                }, indent=2)
-                            else:
-                                logging.error(f"[get_last_memory] File not found at path {actual_file_path} (from metadata of memory {memory_id_uuid})")
-                                # Fall through to return the pointer memory itself if file is missing
-                        except Exception as e:
-                            logging.exception(f"[get_last_memory] Error reading file {file_path_str} for memory {memory_id_uuid}: {e}")
-                            # Fall through to return pointer memory if file read fails
-                    
-                    # If not a file pointer, or file operation failed, return the (pointer) memory as processed by mem0
-                    logging.info(f"[get_last_memory] Returning memory (not file content): {mem_candidate_from_mem0['id']}")
-                    db.commit() # Commit access log for the memory itself
-                    return json.dumps(mem_candidate_from_mem0, indent=2)
-            
-            # If loop finishes, no accessible recent memory was found
-            logging.info("[get_last_memory] No accessible recent memories found after checking all candidates.")
-            db.commit() # Commit any pending logs from non-accessible checks if any
-            return json.dumps({"message": "No accessible recent memories found"}, indent=2)
-        finally:
-            db.close()
-    except Exception as e:
-        logging.exception(f"[get_last_memory] Top-level exception: {e}")
-        return json.dumps({"error": f"Critical error in get_last_memory: {str(e)}"}, indent=2)
+    except Exception as e_top:
+        logging.exception(f"[get_last_memory] Top-level exception: {e_top}")
+        if db: db.close() # Ensure db is closed on error
+        return json.dumps({"error": f"Critical error in get_last_memory: {str(e_top)}"}, indent=2)
 
 @mcp.tool(description="Delete all memories in the user\'s memory. If a memory is a file pointer, only the pointer is deleted, not the underlying file.")
 async def delete_all_memories() -> str:
